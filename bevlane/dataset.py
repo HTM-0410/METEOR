@@ -21,6 +21,22 @@ _CAM_FALLBACK = {"CAM_BACK_NARROW": "CAM_BACK_WIDE",
                  "CAM_FRONT_WIDE": "CAM_FRONT_NARROW"}
 
 
+def navsim_driving_command_to_meteor(command):
+    """NAVSIM [left, straight, right, unknown] -> METEOR intent [S, L, R].
+
+    Unknown is deliberately all-zero: it means that no navigation command is
+    available, rather than a fourth trajectory mode.
+    """
+    command = np.asarray(command, dtype=np.float32).reshape(-1)
+    if command.size != 4 or not np.isfinite(command).all():
+        raise ValueError(
+            "driving_command must be finite NAVSIM [left, straight, right, unknown]"
+        )
+    if command[3] > 0.5 or float(command[:3].sum()) <= 0.0:
+        return np.zeros(3, dtype=np.float32)
+    return command[[1, 0, 2]].astype(np.float32, copy=True)
+
+
 class BevLaneDataset(Dataset):
     def __init__(self, root, scenes, max_per_scene=None, gt_key="gt",
                  dontcare_sidewalk=False, with_depth=False, augment=False,
@@ -34,7 +50,8 @@ class BevLaneDataset(Dataset):
                  with_unknown_v2=False, unk2_key="unknown_v2",
                  with_sdmap=False, with_tlin=False, cam_drop=0.0,
                  n_cams=len(CAMS), img_scale=1, yaw_fix_deg=0.0,
-                 use_gt_valid=False, ego_mask_prefix=None):
+                 use_gt_valid=False, ego_mask_prefix=None,
+                 with_command=False):
         # img_scale=2: R7 resolution axis, phase "upsample-first" -- the
         # stored 432x768 jpgs are bicubic-upsampled on load and K is scaled
         # to match, so the x2/stride-8 model trains BEFORE the true-res
@@ -71,6 +88,7 @@ class BevLaneDataset(Dataset):
         self._byfi = {}
         self.with_bbox2d = with_bbox2d
         self.with_ego = with_ego
+        self.with_command = with_command
         self.with_occ = with_occ
         self.with_tl = with_tl
         self.with_risk = with_risk
@@ -88,6 +106,11 @@ class BevLaneDataset(Dataset):
         self.augment = augment
         self.items = []
         self.calib = {}
+        # Most datasets keep images below <root>/<scene>.  External datasets
+        # (for example NAVSIM/OpenScene) can point at their immutable sensor
+        # blob tree instead, avoiding a second copy of hundreds of GB of JPEGs.
+        # The manifest paths remain relative to this per-scene image root.
+        self.image_roots = {}
         # Cameras a recording simply does not have (x2gen2 is a 7-camera
         # J6Gen2 set: no CAM_BACK_NARROW). Its per-camera arrays are already
         # written in the 8-slot layout with slot 7 empty (depth4n ch1 zeros,
@@ -125,6 +148,15 @@ class BevLaneDataset(Dataset):
                 m = json.load(open(mf))
             except Exception:
                 continue
+            if self.with_command:
+                missing_commands = [f.get("frame", i) for i, f in
+                                    enumerate(m.get("frames", ()))
+                                    if "driving_command" not in f]
+                if missing_commands:
+                    raise ValueError(
+                        f"{s} has no driving_command for frame "
+                        f"{missing_commands[0]} (and possibly more)"
+                    )
             miss = [c for c in CAMS if c not in m["cams"]]
             if len(miss) > 3:                   # too little of the rig left
                 continue
@@ -147,6 +179,13 @@ class BevLaneDataset(Dataset):
                 for c in CAMS])
             self.calib[s] = (K, Tc)
             self.hw[s] = tuple(m.get("img_hw", (432, 768)))
+            image_root = m.get("image_root")
+            if image_root:
+                if not os.path.isabs(image_root):
+                    image_root = os.path.abspath(os.path.join(root, s, image_root))
+                self.image_roots[s] = image_root
+            else:
+                self.image_roots[s] = os.path.join(root, s)
             # Scenes whose 3D-box annotation was never produced. x2gen2 ships
             # bev_box_p / agent_traj files that are EMPTY in every frame (2D
             # boxes are present, only the BEV/3D conversion never ran), and an
@@ -201,6 +240,34 @@ class BevLaneDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def image_path(self, scene, relative_path):
+        """Resolve one manifest image path, including external sensor roots."""
+        if os.path.isabs(relative_path):
+            return relative_path
+        return os.path.join(self.image_roots.get(scene,
+                                                 os.path.join(self.root, scene)),
+                            relative_path)
+
+    def read_image(self, scene, relative_path):
+        """Read BGR and normalize its pixel geometry to manifest ``img_hw``.
+
+        NAVSIM images stay in the immutable raw sensor tree at their native
+        resolution.  Their converter stores K already scaled to ``img_hw``;
+        resizing here keeps pixels and intrinsics in the same coordinate system.
+        Existing METEOR datasets are normally already at the target size, so
+        this branch is a no-op for them.
+        """
+        img = cv2.imread(self.image_path(scene, relative_path))
+        if img is None:
+            return None
+        th, tw = self.hw[scene]
+        if img.shape[:2] != (th, tw):
+            interpolation = (cv2.INTER_AREA
+                             if img.shape[0] >= th and img.shape[1] >= tw
+                             else cv2.INTER_LINEAR)
+            img = cv2.resize(img, (tw, th), interpolation=interpolation)
+        return img
+
     def __getitem__(self, i):
         n = len(self.items)
         # stride the retries: consecutive indices are consecutive FRAMES of one
@@ -233,7 +300,7 @@ class BevLaneDataset(Dataset):
                     (3, self.hw[s][0] * self.img_scale,
                      self.hw[s][1] * self.img_scale), np.float32))
                 continue
-            img = cv2.imread(os.path.join(self.root, s, f["imgs"][c]))
+            img = self.read_image(s, f["imgs"][c])
             if img is None:      # unreadable sample: fall back to a neighbor
                 return None            # caller advances
             img = img[:, :, ::-1].astype(np.float32) / 255.0
@@ -268,7 +335,7 @@ class BevLaneDataset(Dataset):
                                 flags=cv2.INTER_NEAREST,
                                 borderMode=cv2.BORDER_CONSTANT,
                                 borderValue=255)
-            if gk != "gt_cons":
+            if gk not in ("gt_cons", "gt_map"):
                 gt[gt == 255] = 0      # rotation border -> ignore(0)
         if gk == "gt_cons":
             gt = gt.copy()
@@ -626,8 +693,7 @@ class BevLaneDataset(Dataset):
                         if ci in _gone or c not in fp["imgs"]:
                             tmp.append(np.zeros((3, 432, 768), np.float32))
                             continue
-                        im = cv2.imread(os.path.join(self.root, s,
-                                                     fp["imgs"][c]))
+                        im = self.read_image(s, fp["imgs"][c])
                         if im is None:
                             ok = False
                             break
@@ -662,8 +728,7 @@ class BevLaneDataset(Dataset):
                 ok = True
                 tmp = []
                 for c in CAMS:
-                    im = cv2.imread(os.path.join(self.root, s,
-                                                 fp["imgs"].get(c, "_")))
+                    im = self.read_image(s, fp["imgs"].get(c, "_"))
                     if im is None:
                         ok = False
                         break
@@ -681,6 +746,11 @@ class BevLaneDataset(Dataset):
             out.append(torch.from_numpy(np.ascontiguousarray(pimgs)))
             out.append(torch.from_numpy(rel))
             out.append(torch.from_numpy(pv))
+        # Append command last so enabling it cannot shift the long-standing
+        # optional-target indices (depth, boxes, ego, occupancy, temporal...).
+        if self.with_command:
+            out.append(torch.from_numpy(navsim_driving_command_to_meteor(
+                f["driving_command"])))
         # clone -> each tensor owns fresh, resizable storage (from_numpy storage
         # is not resizable, which breaks the shared-memory DataLoader collate)
         return tuple(t.clone() for t in out)

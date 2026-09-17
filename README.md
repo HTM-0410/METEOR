@@ -174,7 +174,9 @@ not be comparable to public benchmarks. What the release does state:
   difference into an apparent 10 % regression);
 - latency and FPS on the target device are below.
 
-Evaluation on a public benchmark is on the roadmap.
+An experimental NAVSIM v2.2 adapter is now included for public, zero-shot trajectory evaluation;
+no NAVSIM score is claimed until the official dataset/cache run is completed. See
+[docs/NAVSIM.md](docs/NAVSIM.md) for the compatibility boundaries and exact command.
 
 ## Edge deployment: Jetson AGX Orin
 
@@ -324,6 +326,7 @@ deploy/                  export + TensorRT runtimes
   orin/                  Orin-side scripts (demo.sh, demo_cpp.sh, bench, health checks, job template)
   build_engine_fp16.py   plugin-free fp16 engine for any NVIDIA GPU (the workstation reproduction path)
 hf/                      Hugging Face release: model / dataset cards, publish_to_hf.py, onnx_smoke_test.py
+navsim_meteor/           NAVSIM AbstractAgent, camera/calibration adapter and Hydra agent config
 docs/                    architecture / data pipeline / training / demo / quickstart / reproduce
 comlops-*.csv            2D taxonomies (21-class semantic, 10-class instance)
 out/                     created at run time for checkpoints, engines and videos (git-ignored)
@@ -365,6 +368,8 @@ If you use METEOR in your work, please cite it (see [CITATION.cff](CITATION.cff)
 | [DATA_PIPELINE.md](docs/DATA_PIPELINE.md) | the autolabel factory, taxonomies, quality gates |
 | [TRAINING.md](docs/TRAINING.md) | losses, curricula, rolling rounds, operational notes |
 | [DEMO.md](docs/DEMO.md) | demo tooling and video layouts |
+| [NAVSIM.md](docs/NAVSIM.md) | experimental NAVSIM v2.2 integration, setup, scoring and evidence boundary |
+| [NAVSIM_DATA_TO_METEOR.md](docs/NAVSIM_DATA_TO_METEOR.md) | NAVSIM mini raw format, zero-copy ingestion, camera/calibration mapping and METEOR DataLoader contract |
 
 ### Silent failures we learned to test for
 
@@ -383,7 +388,8 @@ against final epochs. The detection rules live in [docs/TRAINING.md](docs/TRAINI
 - Promote the 2:4 sparse trunk (the released v157) to the device default; the dense baseline is still the default on our Orin.
 - Ship the LiDAR-capable export as the single engine, with LiDAR as a runtime switch (the host-side presence flag is in place).
 - A history-aware line trained from scratch (the temporal memory is unused today; a history-aware engine costs about +22 ms on the Orin) — one run is in progress.
-- Evaluation on a public benchmark, so accuracy can be reported in comparable terms.
+- Complete and publish the official NAVSIM run (the zero-shot adapter is present; score and
+  per-scenario evidence are not yet measured).
 - An Autoware (ROS 2) node around the released ONNX; today METEOR ships with its own Python and C++ runtimes.
 - VLA support: a vision-language-action layer on top of METEOR's BEV features for long-tail understanding, instruction following and explanations, with METEOR's driving-command input as the interface.
 

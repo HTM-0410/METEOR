@@ -65,7 +65,7 @@ def main():
         pred = logits.argmax(1)[0].cpu().numpy().astype(np.uint8)
         s, f = ds.items[i]
         # a 7-camera recording (x2gen2) has no CAM_BACK_NARROW entry
-        raws = [cv2.imread(os.path.join(args.root, s, f["imgs"][c]))
+        raws = [ds.read_image(s, f["imgs"][c])
                 if c in f["imgs"] else None for c in CAMS]
         img = panel(raws, gt.numpy().astype(np.uint8), pred)
         name = f"{args.scene.split('+0900_')[-1]}_{f['frame']:04d}.jpg"

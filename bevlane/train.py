@@ -661,8 +661,8 @@ def _temporal_inputs(model, batch, device, tmp_idx):
 
 
 def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
-                 batch_stride=1, shard=(0, 1), raw=False,
-                 tmp_idx=None):
+                  batch_stride=1, shard=(0, 1), raw=False,
+                  tmp_idx=None, command_idx=None):
     """E2E head metrics: trajectory ADE/FDE [m], steer MAE [rad],
     accel MAE [m/s^2], brake accuracy. Valid frames only."""
     model.eval()
@@ -685,13 +685,16 @@ def evaluate_ego(model, loader, device, ego_idx, max_batches=40,
             break
         imgs, K, Tc = (t.to(device, non_blocking=True) for t in batch[:3])
         eg = batch[ego_idx].to(device, non_blocking=True)
+        intent = (batch[command_idx].to(device, non_blocking=True)
+                  if command_idx is not None else None)
         v_ = eg[:, 16]
         if v_.sum() == 0:
             continue
         pb, th = _temporal_inputs(model, batch, device, tmp_idx)
         with torch.autocast("cuda", torch.float16):
-            out = model(imgs, K, Tc, eg[:, 12], pb, th) if th is not None \
-                else model(imgs, K, Tc, eg[:, 12])
+            intent_kw = {"intent": intent} if intent is not None else {}
+            out = model(imgs, K, Tc, eg[:, 12], pb, th, **intent_kw) \
+                if th is not None else model(imgs, K, Tc, eg[:, 12], **intent_kw)
         if not (isinstance(out, tuple) and len(out) >= 8):
             break
         p = out[7].float()
@@ -1559,7 +1562,7 @@ def main():
                     help="extra weight on the +3.0 s waypoint of the "
                          "SELECTED candidate, added on top of the "
                          "per-step loss. Re-weighting the profile "
-                         "instead (r56, flat EGO_TW) cost 18 % of ADE "
+                         "instead (r56, flat EGO_TW) cost 18 %% of ADE "
                          "and ADEc; this adds supervision without "
                          "removing any.")
     ap.add_argument("--ego-w", type=float, default=0.0,
@@ -1582,9 +1585,12 @@ def main():
     ap.add_argument("--unk-dense-w", type=float, default=0.0)
     ap.add_argument("--intent-drop", type=float, default=0.3,
                     help="fraction of samples whose driving command is zeroed "
-                         "(modality dropout). The selector is evaluated with "
-                         "NO command, so this is what trains it to infer the "
-                         "manoeuvre instead of copying the command.")
+                         "(modality dropout), retaining command-free robustness")
+    ap.add_argument("--driving-command-source", default="derived",
+                    choices=["derived", "raw"],
+                    help="derived = infer intent from future waypoint GT (legacy); "
+                         "raw = consume manifest NAVSIM driving_command and use "
+                         "the same [straight,left,right] contract as inference")
     ap.add_argument("--intent-w", type=float, default=0.0,
                     help="v43 command-consistency hinge weight")
     ap.add_argument("--paint-seg", default="",
@@ -1823,8 +1829,9 @@ def main():
     ap.add_argument("--box-corner-w", type=float, default=0.0,
                     help="metric 4-corner geometry loss (train-only)")
     ap.add_argument("--dontcare-sidewalk", action="store_true")
-    ap.add_argument("--gt-key", default="gt", choices=["gt", "gt_vec", "gt_cons"],
-                    help="gt = raster autolabel; gt_vec = hybrid vector-line GT")
+    ap.add_argument("--gt-key", default="gt", choices=["gt", "gt_vec", "gt_cons", "gt_map"],
+                    help="gt = raster autolabel; gt_vec = hybrid vector-line GT; "
+                         "gt_map = nuPlan map geometry proxy (255 elsewhere)")
     args = ap.parse_args()
     if getattr(args, "det_head_only", False):
         args.det_only = True          # losses are dropped the same way as det-only
@@ -1890,6 +1897,14 @@ def main():
     # v32 additionally takes the pillar BEV raster (extract_lidar_bev.py)
     use_lidarbev = args.model in ("v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
     use_flow = args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and args.flow_w > 0
+    intent_models = ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44",
+                     "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53",
+                     "v54", "v55", "v56", "v63b", "v64r50", "v52r50",
+                     "v52r50s8", "v52rvgg", "v55rvgg", "v52s8")
+    use_raw_command = args.driving_command_source == "raw"
+    if use_raw_command and (args.model not in intent_models or not use_ego):
+        raise SystemExit("--driving-command-source raw requires an intent-capable "
+                         "model (v37+) and --ego-w > 0")
     hist_n = 3 if args.model in ("v29", "v30", "v31", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") else 0
     if args.train_list:                       # restrict train to a scene list
         keep = set(open(args.train_list).read().split())
@@ -1927,7 +1942,8 @@ def main():
                         yaw_fix_deg=args.yaw_fix_deg,
                         use_gt_valid=args.gt_valid,
                         ego_mask_prefix=("cosmos3_" if args.cosmos_no_ego
-                                         else None))
+                                         else None),
+                        with_command=use_raw_command)
     # NOTE: --limit-train no longer slices the dataset here; it is applied
     # per epoch by EpochSubsetSampler so each epoch sees fresh frames.
     if True:   # all ranks: the distributed ADE probe shards the val set
@@ -1951,9 +1967,10 @@ def main():
                             unk2_key=args.unk_key,
                             with_sdmap=use_sdmap, with_tlin=use_tlin,
                             trim_start=3, trim_end=args.trim_end,
-                            n_cams=args.n_cams,
-                            yaw_fix_deg=args.yaw_fix_deg,
-                            use_gt_valid=args.gt_valid)
+                             n_cams=args.n_cams,
+                             yaw_fix_deg=args.yaw_fix_deg,
+                             use_gt_valid=args.gt_valid,
+                             with_command=use_raw_command)
         seen = min(args.limit_train or len(tr), len(tr)) * args.epochs
         print(f"train {len(tr)} samples / {len(train_s)} scenes; "
               f"val {len(va)} samples / {len(val_s)} scenes; "
@@ -2908,8 +2925,14 @@ def main():
             if use_temporal:
                 prev_imgs, rel_pose, prev_valid = (batch[bi], batch[bi + 1],
                                                    batch[bi + 2])
+                bi += 3
             else:
                 prev_imgs = rel_pose = prev_valid = None
+            raw_command = batch[bi] if use_raw_command else None
+            bi += 1 if use_raw_command else 0
+            if bi != len(batch):
+                raise RuntimeError(f"DataLoader tuple mismatch: consumed {bi} of "
+                                   f"{len(batch)} tensors")
             if args.bev_rot_aug > 0:
                 (Tc, gt, det_boxes, traj_gt, ego_gt, occ_gt, risk_gt,
                  lg_pts_gt, unk_c, rel_pose, unk_v2) = bev_rotation_aug(
@@ -2953,9 +2976,13 @@ def main():
                 pb = pb.float()
                 theta = make_warp_theta(rel_pose)
             intent_oh = None
-            if args.model in ("v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8") and ego_gt is not None:
-                lat = ego_gt[:, 11]
-                if args.model in ("v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8"):
+            if args.model in intent_models and ego_gt is not None:
+                if raw_command is not None:
+                    # Same [straight,left,right] contract as NAVSIM inference.
+                    # Unknown commands remain all-zero and are not replaced by
+                    # future-derived labels (that would leak the realised path).
+                    intent_oh = raw_command.float()
+                elif args.model in ("v43", "v44", "v45", "v46", "v47", "v48", "v49", "v51", "v52", "v53", "v54", "v55", "v56", "v63b", "v64r50", "v52r50", "v52r50s8", "v52rvgg", "v55rvgg", "v52s8"):
                     # v43: earlier-firing command -- ANY waypoint (1.5-3 s)
                     # crossing +-2.0 m counts, so the command is active on
                     # the approach, not only mid-turn (matches the pseudo-nav
@@ -2965,17 +2992,18 @@ def main():
                     lmin = wpy.min(1).values
                     idx = torch.where(lmax > 2.0, 1,
                                       torch.where(lmin < -2.0, 2, 0))
+                    intent_oh = F.one_hot(idx.long(), 3).float()
                 else:
+                    lat = ego_gt[:, 11]
                     idx = torch.where(lat > 2.5, 1,
                                       torch.where(lat < -2.5, 2, 0))
-                intent_oh = F.one_hot(idx.long(), 3).float()
-                # COUNTERFACTUAL COMMANDS (phase 2). The command is derived
-                # from the GT future, so "turn left" is only ever seen on
-                # frames that do turn left: mode 1 learns "the left turn this
-                # scene affords", not "go left". Feed a deliberately WRONG
+                    intent_oh = F.one_hot(idx.long(), 3).float()
+                # COUNTERFACTUAL COMMANDS (phase 2). Feed a deliberately WRONG
                 # command on a fraction of rows and drop their waypoint
                 # supervision -- the GT no longer describes the commanded
-                # manoeuvre, so only the direction hinge may speak there.
+                # manoeuvre, so only the direction hinge may speak there. This
+                # remains useful for both legacy future-derived intent and the
+                # real NAVSIM route command.
                 if args.intent_wrong > 0:
                     _B = intent_oh.shape[0]
                     _has = intent_oh.sum(1) > 0.5
@@ -3636,6 +3664,7 @@ def main():
                         max_batches=12, batch_stride=3,
                         shard=(rank if ddp else 0, world if ddp else 1),
                         raw=True,
+                        command_idx=(-1 if use_raw_command else None),
                         tmp_idx=(4 + int(use_seg2d) + 4 * int(use_traj)
                                  + int(use_ego) + int(use_occ)
                                  + int(use_tl) + int(use_risk)
@@ -3827,7 +3856,8 @@ def main():
                 # on; it gets the full slice.
                 eg = evaluate_ego(net, dv_ep, device,
                                   4 + int(use_seg2d) + 4 * int(use_traj),
-                                  max_batches=len(dv_ep) + 1, tmp_idx=vtmp)
+                                  max_batches=len(dv_ep) + 1, tmp_idx=vtmp,
+                                  command_idx=(-1 if use_raw_command else None))
                 if eg:
                     print(f"[valE2E ep{ep}] ADE={eg['ade']:.2f}m "
                           f"ADEc={eg['ade_c']:.2f}m "
@@ -3843,7 +3873,8 @@ def main():
             if use_ego and eg and dv_hs is not None:
                 _hs = evaluate_ego(net, dv_hs, device,
                                    4 + int(use_seg2d) + 4 * int(use_traj),
-                                   max_batches=len(dv_hs) + 1, tmp_idx=vtmp)
+                                   max_batches=len(dv_hs) + 1, tmp_idx=vtmp,
+                                   command_idx=(-1 if use_raw_command else None))
                 if _hs:
                     eg["hs_bias"], eg["hs_n"] = _hs["hs_bias"], _hs["hs_n"]
                     print(f"[valHS ep{ep}] high-speed wp0 bias={_hs['hs_bias']:+.3f}m "
@@ -3857,11 +3888,13 @@ def main():
                     eg_e = evaluate_ego(net, dv_ep, device,
                                         4 + int(use_seg2d) + 4 * int(use_traj),
                                         max_batches=len(dv_ep) + 1,
-                                        tmp_idx=vtmp)
+                                        tmp_idx=vtmp,
+                                        command_idx=(-1 if use_raw_command else None))
                     if eg_e and dv_hs is not None:
                         _hse = evaluate_ego(net, dv_hs, device,
                                             4 + int(use_seg2d) + 4 * int(use_traj),
-                                            max_batches=len(dv_hs) + 1, tmp_idx=vtmp)
+                                            max_batches=len(dv_hs) + 1, tmp_idx=vtmp,
+                                            command_idx=(-1 if use_raw_command else None))
                         if _hse:
                             eg_e["hs_bias"], eg_e["hs_n"] = _hse["hs_bias"], _hse["hs_n"]
                             if is_main:
