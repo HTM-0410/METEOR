@@ -1,0 +1,9 @@
+# Install torch and torchvision for your CPU/CUDA platform first; see README.md.
+numpy==2.3.5
+pandas==2.3.3
+opencv-python==4.13.0.92
+Pillow==12.2.0
+scipy==1.17.1
+laspy==2.7.0
+lazrs==0.8.2
+transformers==5.7.0

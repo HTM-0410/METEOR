@@ -1,0 +1,13 @@
+{
+  "source_root": "D:/Backup_rosbag",
+  "work_root": "D:/PNK_meteor_build",
+  "panoptic_model": "facebook/mask2former-swin-small-cityscapes-panoptic",
+  "panoptic_revision": "a87607429f7474fd1e2d1d55d6a4ce18a893a526",
+  "panoptic_batch_size": 8,
+  "target_workers": 4,
+  "rectification_alpha": 0.0,
+  "jpeg_quality": 95,
+  "lane_radius": 8,
+  "lane_visual_every": 25,
+  "occupancy_radius": 3
+}
